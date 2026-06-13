@@ -23,6 +23,13 @@ class BaseTaskHandler(BaseApiHandler):
     DATE_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
 
     def get_task_args(self):
+        """Parse, validate and normalize a task invocation request body.
+
+        Every task-dispatch entry point (apply, async-apply, send-task) funnels
+        through here, so they accept identical input and reject malformed input
+        identically with HTTP 400 instead of each rolling its own (divergent)
+        validation.
+        """
         try:
             body = self.request.body
             options = json_decode(body) if body else {}
@@ -37,15 +44,39 @@ class BaseTaskHandler(BaseApiHandler):
 
         if not isinstance(args, (list, tuple)):
             raise HTTPError(400, 'args must be an array')
+        if not isinstance(kwargs, dict):
+            raise HTTPError(400, 'kwargs must be an object')
 
+        self.normalize_options(options)
         return args, kwargs, options
+
+    def get_task(self, taskname):
+        """Look up a registered task by name or raise HTTP 404."""
+        try:
+            return self.capp.tasks[taskname]
+        except KeyError as exc:
+            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
 
     @staticmethod
     def backend_configured(result):
+        # Duck-typed on ``.backend`` so it works for both an AsyncResult and a
+        # task object (both expose the app's result backend).
         return not isinstance(result.backend, DisabledBackend)
 
     def write_error(self, status_code, **kwargs):
         self.set_status(status_code)
+
+    def build_response(self, result):
+        """Build the base dispatch response shared by all entry points.
+
+        ``state`` is only meaningful when a result backend is configured, so it
+        is included only in that case rather than letting a missing backend turn
+        into an opaque error.
+        """
+        response = {'task-id': result.task_id}
+        if self.backend_configured(result):
+            response['state'] = result.state
+        return response
 
     def update_response_result(self, response, result):
         if result.state == states.FAILURE:
@@ -55,24 +86,41 @@ class BaseTaskHandler(BaseApiHandler):
             response.update({'result': self.safe_result(result.result)})
 
     def normalize_options(self, options):
-        if 'eta' in options:
-            options['eta'] = datetime.strptime(options['eta'],
-                                               self.DATE_FORMAT)
-        if 'countdown' in options:
-            options['countdown'] = float(options['countdown'])
-        if 'expires' in options:
-            expires = options['expires']
-            try:
-                expires = float(expires)
-            except ValueError:
-                expires = datetime.strptime(expires, self.DATE_FORMAT)
-            options['expires'] = expires
+        """Coerce apply_async options in place, raising HTTP 400 on bad input.
+
+        Centralized so an illegal value -- wrong type *or* an unparseable
+        string -- is always reported as a 400 rather than leaking a TypeError
+        as an opaque 500.
+        """
+        try:
+            if 'eta' in options:
+                options['eta'] = self._parse_datetime(options['eta'])
+            if 'countdown' in options:
+                options['countdown'] = float(options['countdown'])
+            if 'expires' in options:
+                options['expires'] = self._parse_expires(options['expires'])
+        except (TypeError, ValueError) as exc:
+            raise HTTPError(400, f'Invalid option: {exc}') from exc
+
+    def _parse_datetime(self, value):
+        if not isinstance(value, str):
+            raise TypeError(
+                f'expected a date string formatted as {self.DATE_FORMAT!r}, '
+                f'got {type(value).__name__}')
+        return datetime.strptime(value, self.DATE_FORMAT)
+
+    def _parse_expires(self, value):
+        # ``expires`` accepts either a number of seconds or a date string.
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return self._parse_datetime(value)
 
     def safe_result(self, result):
         "returns json encodable result"
         try:
             json.dumps(result)
-        except TypeError:
+        except (TypeError, ValueError, OverflowError):
             return repr(result)
         return result
 
@@ -116,22 +164,23 @@ Execute a task by name and wait results
 :query kwargs: a dictionary of arguments
 :reqheader Authorization: optional OAuth token to authenticate
 :statuscode 200: no error
+:statuscode 400: invalid arguments or options
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
+:statuscode 503: result backend is not configured
         """
         args, kwargs, options = self.get_task_args()
         logger.debug("Invoking a task '%s' with '%s' and '%s'",
                      taskname, args, kwargs)
 
-        try:
-            task = self.capp.tasks[taskname]
-        except KeyError as exc:
-            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
+        task = self.get_task(taskname)
 
-        try:
-            self.normalize_options(options)
-        except ValueError as exc:
-            raise HTTPError(400, 'Invalid option') from exc
+        # ``apply`` blocks for the result, which is impossible without a result
+        # backend. Fail fast and consistently (like /result and /abort) with a
+        # 503 instead of dispatching a task whose result can never be read or
+        # crashing inside ``result.get()``.
+        if not self.backend_configured(task):
+            raise HTTPError(503)
 
         result = task.apply_async(args=args, kwargs=kwargs, **options)
         response = {'task-id': result.task_id}
@@ -145,8 +194,7 @@ Execute a task by name and wait results
         result.get(propagate=False)
         # Write results and finish async function
         self.update_response_result(response, result)
-        if self.backend_configured(result):
-            response.update(state=result.state)
+        response['state'] = result.state
         return response
 
 
@@ -191,6 +239,7 @@ Execute a task
 :query options: a dictionary of `apply_async` keyword arguments
 :reqheader Authorization: optional OAuth token to authenticate
 :statuscode 200: no error
+:statuscode 400: invalid arguments or options
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
         """
@@ -198,21 +247,9 @@ Execute a task
         logger.debug("Invoking a task '%s' with '%s' and '%s'",
                      taskname, args, kwargs)
 
-        try:
-            task = self.capp.tasks[taskname]
-        except KeyError as exc:
-            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
-
-        try:
-            self.normalize_options(options)
-        except ValueError as exc:
-            raise HTTPError(400, 'Invalid option') from exc
-
+        task = self.get_task(taskname)
         result = task.apply_async(args=args, kwargs=kwargs, **options)
-        response = {'task-id': result.task_id}
-        if self.backend_configured(result):
-            response.update(state=result.state)
-        self.write(response)
+        self.write(self.build_response(result))
 
 
 class TaskSend(BaseTaskHandler):
@@ -253,6 +290,7 @@ Execute a task by name (doesn't require task sources)
 :query kwargs: a dictionary of arguments
 :reqheader Authorization: optional OAuth token to authenticate
 :statuscode 200: no error
+:statuscode 400: invalid arguments or options
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
         """
@@ -261,10 +299,7 @@ Execute a task by name (doesn't require task sources)
                      taskname, args, kwargs)
         result = self.capp.send_task(
             taskname, args=args, kwargs=kwargs, **options)
-        response = {'task-id': result.task_id}
-        if self.backend_configured(result):
-            response.update(state=result.state)
-        self.write(response)
+        self.write(self.build_response(result))
 
 
 class TaskResult(BaseTaskHandler):
@@ -300,8 +335,7 @@ Get a task result
 :statuscode 401: unauthorized request
 :statuscode 503: result backend is not configured
         """
-        timeout = self.get_argument('timeout', None)
-        timeout = float(timeout) if timeout is not None else None
+        timeout = self.get_argument('timeout', None, type=float)
 
         result = AsyncResult(taskid)
         if not self.backend_configured(result):
