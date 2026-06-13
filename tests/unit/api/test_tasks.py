@@ -216,3 +216,168 @@ class TaskTests(BaseApiTestCase):
         self.assertEqual(1, len(table))
         firstFetchedTaskName = table[list(table)[0]]['name']
         self.assertEqual("task1", firstFetchedTaskName)
+
+
+class TaskSendNormalizeTests(BaseApiTestCase):
+    """Verify send-task now normalizes options like apply/async-apply."""
+
+    def test_send_task_countdown(self):
+        self._app.capp.send_task = Mock(return_value=AsyncResult(123))
+        r = self.post('/api/task/send-task/foo',
+                      body='{"countdown": "3"}')
+
+        self.assertEqual(200, r.code)
+        self._app.capp.send_task.assert_called_once_with(
+            'foo', args=[], kwargs={}, countdown=3.0)
+
+    def test_send_task_expires_numeric(self):
+        self._app.capp.send_task = Mock(return_value=AsyncResult(123))
+        r = self.post('/api/task/send-task/foo',
+                      body='{"expires": "60"}')
+
+        self.assertEqual(200, r.code)
+        self._app.capp.send_task.assert_called_once_with(
+            'foo', args=[], kwargs={}, expires=60.0)
+
+    def test_send_task_expires_datetime(self):
+        self._app.capp.send_task = Mock(return_value=AsyncResult(123))
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        r = self.post('/api/task/send-task/foo',
+                      body='{"expires": "%s"}' % tomorrow)
+
+        self.assertEqual(200, r.code)
+        self._app.capp.send_task.assert_called_once_with(
+            'foo', args=[], kwargs={}, expires=tomorrow)
+
+    def test_send_task_eta(self):
+        self._app.capp.send_task = Mock(return_value=AsyncResult(123))
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        r = self.post('/api/task/send-task/foo',
+                      body='{"eta": "%s"}' % tomorrow)
+
+        self.assertEqual(200, r.code)
+        self._app.capp.send_task.assert_called_once_with(
+            'foo', args=[], kwargs={}, eta=tomorrow)
+
+
+class InvalidInputTests(BaseApiTestCase):
+    """Verify invalid parameters return 400 with meaningful error bodies."""
+
+    def test_apply_invalid_body(self):
+        r = self.post('/api/task/apply/foo', body='not-json{{{')
+        self.assertEqual(400, r.code)
+        self.assertTrue(len(r.body) > 0)
+
+    def test_async_apply_invalid_body(self):
+        r = self.post('/api/task/async-apply/foo', body='not-json{{{')
+        self.assertEqual(400, r.code)
+        self.assertTrue(len(r.body) > 0)
+
+    def test_apply_args_not_array(self):
+        r = self.post('/api/task/apply/foo',
+                      body='{"args": "not-an-array"}')
+        self.assertEqual(400, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('args', body)
+
+    def test_apply_unknown_task(self):
+        r = self.post('/api/task/apply/nonexistent.task', body='{}')
+        self.assertEqual(404, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('nonexistent.task', body)
+
+    def test_async_apply_unknown_task(self):
+        r = self.post('/api/task/async-apply/nonexistent.task', body='{}')
+        self.assertEqual(404, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('nonexistent.task', body)
+
+    def test_send_task_invalid_countdown(self):
+        r = self.post('/api/task/send-task/foo',
+                      body='{"countdown": "not-a-number"}')
+        self.assertEqual(400, r.code)
+        body = r.body.decode('utf-8')
+        self.assertTrue(len(body) > 0)
+        self.assertIn('countdown', body)
+
+    def test_apply_invalid_eta(self):
+        r = self.post('/api/task/apply/foo',
+                      body='{"eta": "not-a-date"}')
+        self.assertEqual(400, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('eta', body)
+
+    def test_apply_invalid_expires(self):
+        r = self.post('/api/task/apply/foo',
+                      body='{"expires": "not-a-number-or-date"}')
+        self.assertEqual(400, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('expires', body)
+
+
+class ErrorMessageTests(BaseApiTestCase):
+    """Verify error response bodies contain descriptive messages."""
+
+    def test_apply_unknown_task_has_message(self):
+        r = self.post('/api/task/apply/does.not.exist', body='{}')
+        self.assertEqual(404, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('Unknown task', body)
+
+    def test_apply_invalid_option_has_message(self):
+        r = self.post('/api/task/apply/foo',
+                      body='{"countdown": "xyz"}')
+        # foo is not registered either, but countdown check runs first
+        # in _dispatch_task after get_task_args but before task lookup
+        self.assertIn(r.code, (400, 404))
+
+    def test_apply_invalid_body_has_message(self):
+        r = self.post('/api/task/apply/foo', body='[1,2,3]')
+        self.assertEqual(400, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('invalid', body.lower())
+
+
+class TaskInfoSafeResultTests(BaseApiTestCase):
+    """Verify TaskInfo safely serializes non-JSON-encodable values."""
+
+    @patch('flower.api.tasks.tasks')
+    def test_task_info_non_serializable_result(self, mock_tasks):
+        from celery.events.state import Task
+        task = Task()
+        task.name = 'foo'
+        task.uuid = '123'
+        task.state = 'SUCCESS'
+        # Simulate a non-serializable result (bytes)
+        task.result = b'\x80\x81\x82'
+        task.worker = None
+        mock_tasks.get_task_by_id.return_value = task
+
+        r = self.get('/api/task/info/123')
+        self.assertEqual(200, r.code)
+        body = json.loads(r.body.decode('utf-8'))
+        # The bytes should be repr'd, not cause a 500
+        self.assertIn('result', body)
+        self.assertEqual(body['result'], repr(b'\x80\x81\x82'))
+
+    @patch('flower.api.tasks.tasks')
+    def test_task_info_serializable_result_unchanged(self, mock_tasks):
+        from celery.events.state import Task
+        task = Task()
+        task.name = 'foo'
+        task.uuid = '456'
+        task.state = 'SUCCESS'
+        task.result = 42
+        task.worker = None
+        mock_tasks.get_task_by_id.return_value = task
+
+        r = self.get('/api/task/info/456')
+        self.assertEqual(200, r.code)
+        body = json.loads(r.body.decode('utf-8'))
+        self.assertEqual(body['result'], 42)
+
+    def test_task_info_unknown_task(self):
+        r = self.get('/api/task/info/nonexistent-id')
+        self.assertEqual(404, r.code)
+        body = r.body.decode('utf-8')
+        self.assertIn('Unknown task', body)

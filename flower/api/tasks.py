@@ -44,9 +44,6 @@ class BaseTaskHandler(BaseApiHandler):
     def backend_configured(result):
         return not isinstance(result.backend, DisabledBackend)
 
-    def write_error(self, status_code, **kwargs):
-        self.set_status(status_code)
-
     def update_response_result(self, response, result):
         if result.state == states.FAILURE:
             response.update({'result': self.safe_result(result.result),
@@ -56,17 +53,57 @@ class BaseTaskHandler(BaseApiHandler):
 
     def normalize_options(self, options):
         if 'eta' in options:
-            options['eta'] = datetime.strptime(options['eta'],
-                                               self.DATE_FORMAT)
+            try:
+                options['eta'] = datetime.strptime(options['eta'],
+                                                   self.DATE_FORMAT)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Invalid option 'eta': {exc}") from exc
         if 'countdown' in options:
-            options['countdown'] = float(options['countdown'])
+            try:
+                options['countdown'] = float(options['countdown'])
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Invalid option 'countdown': {exc}") from exc
         if 'expires' in options:
             expires = options['expires']
             try:
                 expires = float(expires)
-            except ValueError:
-                expires = datetime.strptime(expires, self.DATE_FORMAT)
+            except (ValueError, TypeError):
+                try:
+                    expires = datetime.strptime(expires, self.DATE_FORMAT)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(
+                        f"Invalid option 'expires': {exc}") from exc
             options['expires'] = expires
+
+    def _dispatch_task(self, taskname, use_send_task=False):
+        """Common entry point for task dispatch (apply / async-apply / send).
+
+        Returns ``(result,)`` where *result* is the ``AsyncResult`` produced
+        by either ``task.apply_async`` or ``self.capp.send_task``.
+        """
+        args, kwargs, options = self.get_task_args()
+        logger.debug("Invoking a task '%s' with '%s' and '%s'",
+                     taskname, args, kwargs)
+
+        try:
+            self.normalize_options(options)
+        except ValueError as exc:
+            raise HTTPError(400, str(exc)) from exc
+
+        if use_send_task:
+            result = self.capp.send_task(
+                taskname, args=args, kwargs=kwargs, **options)
+        else:
+            try:
+                task = self.capp.tasks[taskname]
+            except KeyError as exc:
+                raise HTTPError(
+                    404, f"Unknown task '{taskname}'") from exc
+            result = task.apply_async(args=args, kwargs=kwargs, **options)
+
+        return result
 
     def safe_result(self, result):
         "returns json encodable result"
@@ -119,21 +156,7 @@ Execute a task by name and wait results
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
         """
-        args, kwargs, options = self.get_task_args()
-        logger.debug("Invoking a task '%s' with '%s' and '%s'",
-                     taskname, args, kwargs)
-
-        try:
-            task = self.capp.tasks[taskname]
-        except KeyError as exc:
-            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
-
-        try:
-            self.normalize_options(options)
-        except ValueError as exc:
-            raise HTTPError(400, 'Invalid option') from exc
-
-        result = task.apply_async(args=args, kwargs=kwargs, **options)
+        result = self._dispatch_task(taskname)
         response = {'task-id': result.task_id}
 
         response = await IOLoop.current().run_in_executor(
@@ -194,21 +217,7 @@ Execute a task
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
         """
-        args, kwargs, options = self.get_task_args()
-        logger.debug("Invoking a task '%s' with '%s' and '%s'",
-                     taskname, args, kwargs)
-
-        try:
-            task = self.capp.tasks[taskname]
-        except KeyError as exc:
-            raise HTTPError(404, f"Unknown task '{taskname}'") from exc
-
-        try:
-            self.normalize_options(options)
-        except ValueError as exc:
-            raise HTTPError(400, 'Invalid option') from exc
-
-        result = task.apply_async(args=args, kwargs=kwargs, **options)
+        result = self._dispatch_task(taskname)
         response = {'task-id': result.task_id}
         if self.backend_configured(result):
             response.update(state=result.state)
@@ -256,11 +265,7 @@ Execute a task by name (doesn't require task sources)
 :statuscode 401: unauthorized request
 :statuscode 404: unknown task
         """
-        args, kwargs, options = self.get_task_args()
-        logger.debug("Invoking task '%s' with '%s' and '%s'",
-                     taskname, args, kwargs)
-        result = self.capp.send_task(
-            taskname, args=args, kwargs=kwargs, **options)
+        result = self._dispatch_task(taskname, use_send_task=True)
         response = {'task-id': result.task_id}
         if self.backend_configured(result):
             response.update(state=result.state)
@@ -305,7 +310,7 @@ Get a task result
 
         result = AsyncResult(taskid)
         if not self.backend_configured(result):
-            raise HTTPError(503)
+            raise HTTPError(503, 'Result backend is not configured')
         response = {'task-id': taskid, 'state': result.state}
 
         if timeout:
@@ -350,7 +355,7 @@ Abort a running task
 
         result = AbortableAsyncResult(taskid)
         if not self.backend_configured(result):
-            raise HTTPError(503)
+            raise HTTPError(503, 'Result backend is not configured')
 
         result.abort()
 
@@ -634,5 +639,9 @@ Get a task info
         response = task.as_dict()
         if task.worker is not None:
             response['worker'] = task.worker.hostname
+
+        # Ensure all values are JSON-serializable
+        for key, value in response.items():
+            response[key] = self.safe_result(value)
 
         self.write(response)
