@@ -12,14 +12,86 @@ class ControlHandler(BaseApiHandler):
         return workername and workername in self.application.workers
 
     def error_reason(self, workername, response):
-        "extracts error message from response"
+        """Safely extract error message from a Celery control response."""
+        if not response:
+            return 'No response from worker'
+        if not isinstance(response, list):
+            return f'Unexpected response: {response}'
         for res in response:
-            try:
-                return res[workername].get('error', 'Unknown reason')
-            except KeyError:
-                pass
-        logger.error("Failed to extract error reason from '%s'", response)
+            if not isinstance(res, dict):
+                continue
+            # Try exact workername match
+            if workername and workername in res:
+                entry = res[workername]
+                if isinstance(entry, dict):
+                    return entry.get('error', 'Unknown reason')
+                return str(entry)
+            # Fallback: first available entry
+            for entry in res.values():
+                if isinstance(entry, dict):
+                    return entry.get('error', 'Unknown reason')
+                return str(entry)
         return 'Unknown reason'
+
+    def _is_success_response(self, workername, response):
+        """Check if a Celery control response indicates success."""
+        if not response or not isinstance(response, list):
+            return False
+        for res in response:
+            if not isinstance(res, dict):
+                continue
+            if workername:
+                if workername in res:
+                    return isinstance(res[workername], dict) and 'ok' in res[workername]
+                # Specific worker not found in response — treat as failure
+                return False
+            # workername is None (broadcast without destination)
+            for v in res.values():
+                return isinstance(v, dict) and 'ok' in v
+        return False
+
+    def _get_ok_message(self, workername, response):
+        """Extract the 'ok' message from a successful response."""
+        if not response or not isinstance(response, list):
+            return ''
+        for res in response:
+            if not isinstance(res, dict):
+                continue
+            if workername and workername in res:
+                return res[workername].get('ok', '')
+            for v in res.values():
+                if isinstance(v, dict):
+                    return v.get('ok', '')
+        return ''
+
+    def _execute_control(self, workername, command_fn, success_msg):
+        """
+        Execute a Celery control command and write the HTTP response.
+
+        Args:
+            workername: target worker (can be None for broadcast)
+            command_fn: zero-arg callable that invokes the Celery control
+                        and returns the response
+            success_msg: str or callable(response) -> str
+        """
+        try:
+            response = command_fn()
+        except Exception as exc:
+            logger.error("Control command failed: %s", exc)
+            self.set_status(500)
+            self.write(f"Control command failed: {exc}")
+            return
+
+        if self._is_success_response(workername, response):
+            if callable(success_msg):
+                self.write(dict(message=success_msg(response)))
+            else:
+                self.write(dict(message=success_msg))
+        else:
+            logger.error("Control command failed, response: %s", response)
+            self.set_status(403)
+            reason = self.error_reason(workername, response)
+            self.write(f"Failed: {reason}")
 
 
 class WorkerShutDown(ControlHandler):
@@ -97,16 +169,12 @@ Restart worker's pool
             raise web.HTTPError(404, f"Unknown worker '{workername}'")
 
         logger.info("Restarting '%s' worker's pool", workername)
-        response = self.capp.control.broadcast(
-            'pool_restart', arguments={'reload': False},
-            destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=f"Restarting '{workername}' worker's pool"))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to restart the '{workername}' pool: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.broadcast(
+                'pool_restart', arguments={'reload': False},
+                destination=[workername], reply=True),
+            f"Restarting '{workername}' worker's pool")
 
 
 class WorkerPoolGrow(ControlHandler):
@@ -149,15 +217,11 @@ Grow worker's pool
         n = self.get_argument('n', default=1, type=int)
 
         logger.info("Growing '%s' worker's pool by '%s'", workername, n)
-        response = self.capp.control.pool_grow(
-            n=n, reply=True, destination=[workername])
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=f"Growing '{workername}' worker's pool by {n}"))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to grow '{workername}' worker's pool: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.pool_grow(
+                n=n, reply=True, destination=[workername]),
+            f"Growing '{workername}' worker's pool by {n}")
 
 
 class WorkerPoolShrink(ControlHandler):
@@ -200,15 +264,11 @@ Shrink worker's pool
         n = self.get_argument('n', default=1, type=int)
 
         logger.info("Shrinking '%s' worker's pool by '%s'", workername, n)
-        response = self.capp.control.pool_shrink(
-            n=n, reply=True, destination=[workername])
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=f"Shrinking '{workername}' worker's pool by {n}"))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to shrink '{workername}' worker's pool: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.pool_shrink(
+                n=n, reply=True, destination=[workername]),
+            f"Shrinking '{workername}' worker's pool by {n}")
 
 
 class WorkerPoolAutoscale(ControlHandler):
@@ -255,17 +315,12 @@ Autoscale worker pool
 
         logger.info("Autoscaling '%s' worker by '%s'",
                     workername, (min, max))
-        response = self.capp.control.broadcast(
-            'autoscale', arguments={'min': min, 'max': max},
-            destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=f"Autoscaling '{workername}' worker "
-                                    "(min={min}, max={max})"))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to autoscale '{workername}' worker: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.broadcast(
+                'autoscale', arguments={'min': min, 'max': max},
+                destination=[workername], reply=True),
+            f"Autoscaling '{workername}' worker (min={min}, max={max})")
 
 
 class WorkerQueueAddConsumer(ControlHandler):
@@ -309,16 +364,12 @@ Start consuming from a queue
 
         logger.info("Adding consumer '%s' to worker '%s'",
                     queue, workername)
-        response = self.capp.control.broadcast(
-            'add_consumer', arguments={'queue': queue},
-            destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=response[0][workername]['ok']))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to add '{queue}' consumer to '{workername}' worker: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.broadcast(
+                'add_consumer', arguments={'queue': queue},
+                destination=[workername], reply=True),
+            lambda resp: self._get_ok_message(workername, resp))
 
 
 class WorkerQueueCancelConsumer(ControlHandler):
@@ -362,16 +413,12 @@ Stop consuming from a queue
 
         logger.info("Canceling consumer '%s' from worker '%s'",
                     queue, workername)
-        response = self.capp.control.broadcast(
-            'cancel_consumer', arguments={'queue': queue},
-            destination=[workername], reply=True)
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=response[0][workername]['ok']))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to cancel '{queue}' consumer from '{workername}' worker: {reason}")
+        self._execute_control(
+            workername,
+            lambda: self.capp.control.broadcast(
+                'cancel_consumer', arguments={'queue': queue},
+                destination=[workername], reply=True),
+            lambda resp: self._get_ok_message(workername, resp))
 
 
 class TaskRevoke(ControlHandler):
@@ -460,18 +507,13 @@ Change soft and hard time limits for a task
 
         logger.info("Setting timeouts for '%s' task (%s, %s)",
                     taskname, soft, hard)
-        destination = [workername] if workername is not None else None
-        response = self.capp.control.time_limit(
-            taskname, reply=True, hard=hard, soft=soft,
-            destination=destination)
-
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=response[0][workername]['ok']))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to set timeouts: '{reason}'")
+        destination = [workername] if workername else None
+        self._execute_control(
+            workername or None,
+            lambda: self.capp.control.time_limit(
+                taskname, reply=True, hard=hard, soft=soft,
+                destination=destination),
+            lambda resp: self._get_ok_message(workername, resp))
 
 
 class TaskRateLimit(ControlHandler):
@@ -519,13 +561,9 @@ Change rate limit for a task
 
         logger.info("Setting '%s' rate limit for '%s' task",
                     ratelimit, taskname)
-        destination = [workername] if workername is not None else None
-        response = self.capp.control.rate_limit(
-            taskname, ratelimit, reply=True, destination=destination)
-        if response and 'ok' in response[0][workername]:
-            self.write(dict(message=response[0][workername]['ok']))
-        else:
-            logger.error(response)
-            self.set_status(403)
-            reason = self.error_reason(workername, response)
-            self.write(f"Failed to set rate limit: '{reason}'")
+        destination = [workername] if workername else None
+        self._execute_control(
+            workername or None,
+            lambda: self.capp.control.rate_limit(
+                taskname, ratelimit, reply=True, destination=destination),
+            lambda resp: self._get_ok_message(workername, resp))
