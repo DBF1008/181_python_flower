@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 from tornado import web
@@ -139,6 +138,7 @@ List workers
                   "tasks.add": 1
               }
           },
+          "status": true,
           "timestamp": 1438049312.073402
       }
   }
@@ -156,7 +156,7 @@ List workers
 
         if refresh:
             try:
-                await asyncio.wait(self.application.update_workers(workername=workername))
+                await self.application.update_workers(workername=workername)
             except Exception as e:
                 msg = f"Failed to update workers: {e}"
                 logger.error(msg)
@@ -169,15 +169,22 @@ List workers
             self.write(info)
             return
 
+        # Drop dead workers' stale detail (gated on purge_offline_workers) before
+        # reading, so the API agrees with the list view and the single-worker page.
+        self.application.purge_expired_offline()
+
         if self.application.workers and not refresh and\
                 workername in self.application.workers:
-            self.write({workername: self.application.workers[workername]})
+            self.write({workername: self.application.worker_detail(workername)})
             return
 
         if workername and not self.is_worker(workername):
             raise web.HTTPError(404, f"Unknown worker '{workername}'")
 
         if workername:
-            self.write({workername: self.application.workers[workername]})
+            self.write({workername: self.application.worker_detail(workername)})
         else:
-            self.write(self.application.workers)
+            self.write({
+                name: dict(detail, status=self.application.is_worker_alive(name))
+                for name, detail in self.application.workers.items()
+            })

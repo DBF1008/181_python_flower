@@ -1,5 +1,6 @@
 import sys
 import logging
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,6 +30,21 @@ def rewrite_handler(handler, url_prefix):
         return url("/{}{}".format(url_prefix.strip("/"), handler.regex.pattern),
                    handler.handler_class, handler.kwargs, handler.name)
     return ("/{}{}".format(url_prefix.strip("/"), handler[0]), handler[1])
+
+
+def worker_fields(worker):
+    """Extract the display fields of an events-state worker object."""
+    if hasattr(worker, '_fields'):
+        return {k: getattr(worker, k) for k in worker._fields}
+    _fields = ('hostname', 'pid', 'freq', 'heartbeats', 'clock',
+               'active', 'processed', 'loadavg', 'sw_ident',
+               'sw_ver', 'sw_sys')
+    fields = {}
+    for key in _fields:
+        value = getattr(worker, key, None)
+        if value is not None:
+            fields[key] = value
+    return fields
 
 
 class Flower(tornado.web.Application):
@@ -79,7 +95,7 @@ class Flower(tornado.web.Application):
             server.add_socket(socket)
 
         self.started = True
-        self.update_workers()
+        self.io_loop.add_callback(self._safe_initial_update)
         self.io_loop.start()
 
     def stop(self):
@@ -99,5 +115,69 @@ class Flower(tornado.web.Application):
     def workers(self):
         return self.inspector.workers
 
-    def update_workers(self, workername=None):
-        return self.inspector.inspect(workername)
+    async def update_workers(self, workername=None):
+        return await self.inspector.inspect(workername)
+
+    async def _safe_initial_update(self):
+        try:
+            await self.update_workers()
+        except Exception:
+            logger.exception("Initial worker inspection failed")
+
+    def is_worker_alive(self, name):
+        worker = self.events.state.workers.get(name)
+        return bool(worker and worker.alive)
+
+    def worker_detail(self, name):
+        # Inspector detail for a single worker, with aliveness sourced from the
+        # events state so the single-worker view and the list view agree on
+        # `status`. Returns a copy so the cache is never mutated.
+        detail = self.inspector.workers.get(name)
+        if detail is None:
+            return None
+        return dict(detail, status=self.is_worker_alive(name))
+
+    def list_workers(self):
+        # Summary rows for the workers list page: per-worker event counters +
+        # worker fields + aliveness, with offline-expired workers pruned.
+        expired = self.purge_expired_offline()
+        state = self.events.state
+        workers = {}
+        for name, counts in state.counter.items():
+            worker = state.workers.get(name)
+            if worker is None or name in expired:
+                continue
+            info = dict(counts)
+            info.update(worker_fields(worker))
+            info['status'] = worker.alive
+            workers[name] = info
+        return workers
+
+    def _expired_offline_names(self):
+        # The single offline policy, gated on the purge_offline_workers option.
+        # A worker is expired when it is not alive and its last heartbeat is
+        # older than the configured TTL (or it never sent one).
+        ttl = self.options.purge_offline_workers
+        if ttl is None:
+            return set()
+        now = int(time.time())
+        state = self.events.state
+        expired = set()
+        for name in set(self.inspector.workers) | set(state.workers):
+            worker = state.workers.get(name)
+            if worker is not None and worker.alive:
+                continue
+            heartbeats = list(getattr(worker, 'heartbeats', None) or [])
+            last_heartbeat = int(max(heartbeats)) if heartbeats else None
+            if not last_heartbeat or now - last_heartbeat > ttl:
+                expired.add(name)
+        return expired
+
+    def purge_expired_offline(self):
+        # Apply the offline policy to the inspector cache as well, so the API
+        # body and the single-worker page stop serving dead workers' stale
+        # detail -- not just the list view.
+        expired = self._expired_offline_names()
+        for name in expired:
+            self.inspector.workers.pop(name, None)
+        return expired

@@ -1,7 +1,7 @@
 import json
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from celery.events import Event
 from celery.utils import uuid
@@ -67,8 +67,7 @@ class WorkersTests(AsyncHTTPTestCase):
                           local_received=time.time()))
         self.app.events.state = state
 
-        with patch('flower.views.workers.options') as mock_options:
-            mock_options.purge_offline_workers = 0
+        with self.mock_option('purge_offline_workers', 0):
             r = self.get('/workers')
 
         table = HtmlTableParser()
@@ -307,10 +306,11 @@ class WorkersTests(AsyncHTTPTestCase):
                           local_received=time.time()))
         self.app.events.state = state
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/workers?refresh=1')
             self.assertEqual(200, res.code)
-            update_workers_mock.assert_called()
+            update_workers_mock.assert_awaited()
 
     def test_workers_page(self):
         state = EventsState()
@@ -322,12 +322,69 @@ class WorkersTests(AsyncHTTPTestCase):
                                                  'stats': {'total': {'tasks.add': 10, 'tasks.sleep': 1, 'tasks.error': 1},
                                                            'broker': {'hostname': 'redis', 'userid': None, 'virtual_host': '/', 'port': 6379}}}
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/worker/worker1')
             self.assertEqual(200, res.code)
-            update_workers_mock.assert_called_once_with(workername='worker1')
+            update_workers_mock.assert_awaited_once_with(workername='worker1')
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/worker/worker2')
             self.assertEqual(404, res.code)
-            update_workers_mock.assert_called_once_with(workername='worker2')
+            update_workers_mock.assert_awaited_once_with(workername='worker2')
+
+    def test_workers_view_awaits_refresh(self):
+        # Proves the list view awaits update_workers (not fire-and-forget): the
+        # refresh's side effect must be visible in the rendered page.
+        state = EventsState()
+        self.app.events.state = state
+
+        async def populate(*args, **kwargs):
+            state.get_or_create_worker('worker1')
+            state.event(Event('worker-online', hostname='worker1',
+                              local_received=time.time()))
+
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock, side_effect=populate) as m:
+            r = self.get('/workers?refresh=1')
+            self.assertEqual(200, r.code)
+            m.assert_awaited()
+
+        table = HtmlTableParser()
+        table.parse(str(r.body))
+        self.assertTrue(table.get_row('worker1'))
+
+    def test_offline_worker_purged_consistently(self):
+        # One offline policy applied to the list view, the single-worker page,
+        # and the inspector cache.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        state.event(Event('worker-online', hostname='worker1',
+                          local_received=time.time()))
+        state.event(Event('worker-offline', hostname='worker1',
+                          local_received=time.time()))
+        self.app.events.state = state
+        self.app.inspector.workers['worker1'] = {
+            'active_queues': [],
+            'stats': {'total': {'tasks.add': 1},
+                      'broker': {'hostname': 'redis', 'userid': None,
+                                 'virtual_host': '/', 'port': 6379}},
+        }
+
+        with patch.object(self.get_app(), "update_workers", new_callable=AsyncMock):
+            # default (purge disabled): offline worker still listed, detail renders
+            r = self.get('/workers')
+            table = HtmlTableParser()
+            table.parse(str(r.body))
+            self.assertTrue(table.get_row('worker1'))
+            self.assertEqual(200, self.get('/worker/worker1').code)
+
+            # purge enabled: dropped from list, single-worker page, and cache
+            with self.mock_option('purge_offline_workers', 0):
+                r = self.get('/workers')
+                table = HtmlTableParser()
+                table.parse(str(r.body))
+                self.assertEqual(0, len(table.rows()))
+                self.assertEqual(404, self.get('/worker/worker1').code)
+                self.assertNotIn('worker1', self.app.workers)

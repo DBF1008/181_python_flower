@@ -1,3 +1,4 @@
+import asyncio
 import collections
 import logging
 import time
@@ -16,16 +17,25 @@ class Inspector:
         self.timeout = timeout
         self.workers = collections.defaultdict(dict)
 
-    def inspect(self, workername=None):
-        feutures = []
-        for method in self.methods:
-            feutures.append(self.io_loop.run_in_executor(None, partial(self._inspect, method, workername)))
-        return feutures
+    async def inspect(self, workername=None):
+        # Run every inspect method concurrently in the executor, then write the
+        # results back here. This coroutine resumes on the ioloop thread, so the
+        # cache is mutated only from that thread (as documented in events.py) and
+        # is guaranteed to be populated before we return to the caller -- no
+        # add_callback indirection, no read-before-write race.
+        futures = [
+            self.io_loop.run_in_executor(None, partial(self._inspect, method, workername))
+            for method in self.methods
+        ]
+        results = await asyncio.gather(*futures)
 
-    def _on_update(self, workername, method, response):
-        info = self.workers[workername]
-        info[method] = response
-        info['timestamp'] = time.time()
+        for method, mapping in results:
+            for worker, response in mapping.items():
+                if response is not None:
+                    info = self.workers[worker]
+                    info[method] = response
+                    info['timestamp'] = time.time()
+        return self.workers
 
     def _inspect(self, method, workername):
         destination = [workername] if workername else None
@@ -42,7 +52,5 @@ class Inspector:
 
         if result is None or 'error' in result:
             logger.warning("Inspect method %s failed", method)
-            return
-        for worker, response in result.items():
-            if response is not None:
-                self.io_loop.add_callback(partial(self._on_update, worker, method, response))
+            return method, {}
+        return method, result
