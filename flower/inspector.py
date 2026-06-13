@@ -1,4 +1,4 @@
-import collections
+import asyncio
 import logging
 import time
 from functools import partial
@@ -14,18 +14,30 @@ class Inspector:
         self.io_loop = io_loop
         self.capp = capp
         self.timeout = timeout
-        self.workers = collections.defaultdict(dict)
+        self.workers = {}
 
-    def inspect(self, workername=None):
-        feutures = []
+    async def inspect(self, workername=None):
+        futures = []
         for method in self.methods:
-            feutures.append(self.io_loop.run_in_executor(None, partial(self._inspect, method, workername)))
-        return feutures
+            futures.append(
+                self.io_loop.run_in_executor(
+                    None, partial(self._inspect, method, workername)))
+        await asyncio.wait(futures)
+        updates = {}
+        for future in futures:
+            result = future.result()
+            if result:
+                for worker, methods in result.items():
+                    updates.setdefault(worker, {}).update(methods)
+        self._apply_updates(updates)
 
-    def _on_update(self, workername, method, response):
-        info = self.workers[workername]
-        info[method] = response
-        info['timestamp'] = time.time()
+    def _apply_updates(self, updates):
+        now = time.time()
+        for worker, methods in updates.items():
+            if worker not in self.workers:
+                self.workers[worker] = {}
+            self.workers[worker].update(methods)
+            self.workers[worker]['timestamp'] = now
 
     def _inspect(self, method, workername):
         destination = [workername] if workername else None
@@ -42,7 +54,5 @@ class Inspector:
 
         if result is None or 'error' in result:
             logger.warning("Inspect method %s failed", method)
-            return
-        for worker, response in result.items():
-            if response is not None:
-                self.io_loop.add_callback(partial(self._on_update, worker, method, response))
+            return {}
+        return {w: {method: resp} for w, resp in result.items() if resp is not None}

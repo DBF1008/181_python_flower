@@ -1,5 +1,6 @@
 import sys
 import logging
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,6 +30,43 @@ def rewrite_handler(handler, url_prefix):
         return url("/{}{}".format(url_prefix.strip("/"), handler.regex.pattern),
                    handler.handler_class, handler.kwargs, handler.name)
     return ("/{}{}".format(url_prefix.strip("/"), handler[0]), handler[1])
+
+
+_WORKER_FIELDS = ('hostname', 'pid', 'freq', 'heartbeats', 'clock',
+                  'active', 'processed', 'loadavg', 'sw_ident',
+                  'sw_ver', 'sw_sys')
+
+
+def _worker_as_dict(worker):
+    """Convert a Celery State Worker object to a plain dict."""
+    if hasattr(worker, '_fields'):
+        return {k: getattr(worker, k) for k in worker._fields}
+    result = {}
+    for key in _WORKER_FIELDS:
+        value = getattr(worker, key, None)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _purge_offline_workers(workers, threshold, inspector_cache):
+    """Remove offline workers whose last heartbeat exceeds *threshold* seconds.
+
+    Also cleans up stale entries in *inspector_cache* for purged workers.
+    """
+    now = int(time.time())
+    to_remove = []
+    for name, info in workers.items():
+        if info.get('status', True):
+            continue
+        heartbeats = info.get('heartbeats', [])
+        last_heartbeat = int(max(heartbeats)) if heartbeats else None
+        if not last_heartbeat or now - last_heartbeat > threshold:
+            to_remove.append(name)
+    for name in to_remove:
+        workers.pop(name)
+        inspector_cache.pop(name, None)
+        logger.debug("Purged offline worker '%s'", name)
 
 
 class Flower(tornado.web.Application):
@@ -79,7 +117,7 @@ class Flower(tornado.web.Application):
             server.add_socket(socket)
 
         self.started = True
-        self.update_workers()
+        self.io_loop.spawn_callback(self.update_workers)
         self.io_loop.start()
 
     def stop(self):
@@ -99,5 +137,34 @@ class Flower(tornado.web.Application):
     def workers(self):
         return self.inspector.workers
 
-    def update_workers(self, workername=None):
-        return self.inspector.inspect(workername)
+    async def update_workers(self, workername=None):
+        return await self.inspector.inspect(workername)
+
+    def get_workers(self, purge_offline=None):
+        """Unified worker read: merge event state + inspector cache, with
+        centralised offline-worker purging.
+
+        Parameters
+        ----------
+        purge_offline : int or None
+            If not None, purge workers whose last heartbeat is older than
+            this many seconds.
+        """
+        events = self.events.state
+        workers = {}
+        for name, values in events.counter.items():
+            if name not in events.workers:
+                continue
+            worker = events.workers[name]
+            info = dict(values)
+            info.update(_worker_as_dict(worker))
+            info.update(status=worker.alive)
+            if name in self.inspector.workers:
+                for key, value in self.inspector.workers[name].items():
+                    info.setdefault(key, value)
+            workers[name] = info
+
+        if purge_offline is not None:
+            _purge_offline_workers(workers, purge_offline,
+                                   self.inspector.workers)
+        return workers

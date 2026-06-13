@@ -9,7 +9,11 @@ logger = logging.getLogger(__name__)
 
 class ControlHandler(BaseApiHandler):
     def is_worker(self, workername):
-        return workername and workername in self.application.workers
+        if not workername:
+            return False
+        if workername in self.application.workers:
+            return True
+        return workername in self.application.events.state.workers
 
     def error_reason(self, workername, response):
         "extracts error message from response"

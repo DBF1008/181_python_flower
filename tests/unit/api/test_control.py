@@ -1,9 +1,12 @@
 import os
+import time
 from unittest.mock import MagicMock, patch
 
+from celery.events import Event
 from tornado.options import options
 
 from flower.api.control import ControlHandler
+from flower.events import EventsState
 
 from . import BaseApiTestCase
 
@@ -12,6 +15,30 @@ class UnknownWorkerControlTests(BaseApiTestCase):
     def test_unknown_worker(self):
         r = self.post('/api/worker/shutdown/test', body={})
         self.assertEqual(404, r.code)
+
+
+class EventStateWorkerControlTests(BaseApiTestCase):
+    """Regression: is_worker must recognise workers known only via events."""
+
+    def test_worker_known_via_events_is_accepted(self):
+        state = EventsState()
+        state.get_or_create_worker('celery@worker1')
+        state.event(Event('worker-online', hostname='celery@worker1',
+                          local_received=time.time()))
+        self._app.events.state = state
+        # Worker is NOT in inspector cache
+        self.assertNotIn('celery@worker1', self._app.inspector.workers)
+
+        self._app.capp.control.broadcast = MagicMock()
+        r = self.post('/api/worker/shutdown/celery@worker1', body={})
+        self.assertEqual(200, r.code)
+
+    def test_worker_known_via_inspector_cache_is_accepted(self):
+        self._app.inspector.workers['celery@worker1'] = {'stats': {}}
+
+        self._app.capp.control.broadcast = MagicMock()
+        r = self.post('/api/worker/shutdown/celery@worker1', body={})
+        self.assertEqual(200, r.code)
 
 
 class WorkerControlTests(BaseApiTestCase):

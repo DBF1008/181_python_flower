@@ -1,7 +1,7 @@
 import json
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from celery.events import Event
 from celery.utils import uuid
@@ -307,7 +307,8 @@ class WorkersTests(AsyncHTTPTestCase):
                           local_received=time.time()))
         self.app.events.state = state
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/workers?refresh=1')
             self.assertEqual(200, res.code)
             update_workers_mock.assert_called()
@@ -322,12 +323,63 @@ class WorkersTests(AsyncHTTPTestCase):
                                                  'stats': {'total': {'tasks.add': 10, 'tasks.sleep': 1, 'tasks.error': 1},
                                                            'broker': {'hostname': 'redis', 'userid': None, 'virtual_host': '/', 'port': 6379}}}
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/worker/worker1')
             self.assertEqual(200, res.code)
             update_workers_mock.assert_called_once_with(workername='worker1')
 
-        with patch.object(self.get_app(), "update_workers") as update_workers_mock:
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock) as update_workers_mock:
             res = self.get('/worker/worker2')
             self.assertEqual(404, res.code)
             update_workers_mock.assert_called_once_with(workername='worker2')
+
+    # ------------------------------------------------------------------
+    # Regression tests for the refresh chain fix
+    # ------------------------------------------------------------------
+
+    def test_purge_offline_workers_json(self):
+        """Purge must apply to JSON output (DataTables AJAX endpoint)."""
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        state.event(Event('worker-online', hostname='worker1',
+                          local_received=time.time()))
+        state.event(Event('worker-offline', hostname='worker1',
+                          local_received=time.time()))
+        self.app.events.state = state
+
+        with patch('flower.views.workers.options') as mock_options:
+            mock_options.purge_offline_workers = 0
+            mock_options.auto_refresh = True
+            res = self.get('/workers?json=1')
+
+        self.assertEqual(200, res.code)
+        data = json.loads(res.body)
+        hostnames = [w.get('hostname') for w in data['data']]
+        self.assertNotIn('worker1', hostnames)
+
+    def test_purge_also_cleans_inspector_cache(self):
+        """Purging an offline worker must also remove its inspector cache entry."""
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        state.event(Event('worker-online', hostname='worker1',
+                          local_received=time.time()))
+        state.event(Event('worker-offline', hostname='worker1',
+                          local_received=time.time()))
+        self.app.events.state = state
+        self.app.inspector.workers['worker1'] = {'stats': {'pid': 999}}
+
+        with patch('flower.views.workers.options') as mock_options:
+            mock_options.purge_offline_workers = 0
+            mock_options.auto_refresh = True
+            self.get('/workers?json=1')
+
+        self.assertNotIn('worker1', self.app.inspector.workers)
+
+    def test_worker_view_returns_404_for_unknown(self):
+        """Requesting a completely unknown worker must return 404."""
+        with patch.object(self.get_app(), "update_workers",
+                          new_callable=AsyncMock):
+            res = self.get('/worker/unknown@worker')
+            self.assertEqual(404, res.code)
