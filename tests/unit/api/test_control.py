@@ -163,7 +163,7 @@ class WorkerControlTests(BaseApiTestCase):
         app.control.broadcast.assert_called_once_with(
             'add_consumer',
             reply=True, destination=['test'],
-            arguments={'queue': 'foo&amp;bar'})
+            arguments={'queue': 'foo&bar'})
 
 
 class TaskControlTests(BaseApiTestCase):

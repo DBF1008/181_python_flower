@@ -28,7 +28,10 @@ def rewrite_handler(handler, url_prefix):
     if isinstance(handler, url):
         return url("/{}{}".format(url_prefix.strip("/"), handler.regex.pattern),
                    handler.handler_class, handler.kwargs, handler.name)
-    return ("/{}{}".format(url_prefix.strip("/"), handler[0]), handler[1])
+    rewritten = "/{}{}".format(url_prefix.strip("/"), handler[0])
+    if len(handler) >= 3:
+        return (rewritten, handler[1], handler[2])
+    return (rewritten, handler[1])
 
 
 class Flower(tornado.web.Application):

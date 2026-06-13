@@ -9,7 +9,7 @@ from base64 import b64decode
 
 import tornado
 
-from ..utils import template, bugreport, strtobool
+from ..utils import template, bugreport, strtobool, normalize_url_prefix, is_safe_redirect_url
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,19 @@ class BaseHandler(tornado.web.RequestHandler):
         kwargs.update(functions)
         kwargs.update(url_prefix=app_options.url_prefix)
         super().render(*args, **kwargs)
+
+    def get_safe_next_url(self):
+        """Return a safe redirect URL after authentication.
+
+        Reads the ``next`` query parameter, validates it against open-redirect
+        attacks, and falls back to the configured url_prefix or ``/``.
+        """
+        prefix = normalize_url_prefix(self.application.options.url_prefix)
+        default_next = prefix if prefix else '/'
+        next_ = super().get_argument('next', default_next, strip=True)
+        if not is_safe_redirect_url(next_):
+            next_ = default_next
+        return next_
 
     def write_error(self, status_code, **kwargs):
         if status_code in (404, 403):
@@ -94,8 +107,6 @@ class BaseHandler(tornado.web.RequestHandler):
     # pylint: disable=dangerous-default-value
     def get_argument(self, name, default=[], strip=True, type=None):
         arg = super().get_argument(name, default, strip)
-        if arg and isinstance(arg, str):
-            arg = tornado.escape.xhtml_escape(arg)
         if type is not None:
             try:
                 if type is bool:

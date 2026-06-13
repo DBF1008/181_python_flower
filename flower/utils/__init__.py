@@ -1,6 +1,7 @@
 import base64
 import os.path
 import uuid
+from urllib.parse import urlparse
 
 from .. import __version__
 
@@ -36,8 +37,40 @@ def abs_path(path):
     return path
 
 
+def normalize_url_prefix(prefix):
+    """Normalize a URL prefix to a consistent format.
+
+    Returns '' if no prefix is configured (None, empty, or whitespace-only).
+    Otherwise returns '/prefix' — a single leading slash, no trailing slash.
+    """
+    if not prefix or not prefix.strip():
+        return ''
+    return '/' + prefix.strip('/')
+
+
 def prepend_url(url, prefix):
-    return '/' + prefix.strip('/') + url
+    """Prepend *prefix* to *url*. Returns *url* unchanged when prefix is empty."""
+    normalized = normalize_url_prefix(prefix)
+    if not normalized:
+        return url
+    return normalized + url
+
+
+def is_safe_redirect_url(url):
+    """Return True if *url* is a safe same-origin redirect target.
+
+    Only relative paths starting with '/' are considered safe.
+    Absolute URLs (with scheme or netloc) are rejected to prevent
+    open-redirect attacks.
+    """
+    if not url:
+        return False
+    if not url.startswith('/'):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        return False
+    return True
 
 
 def strtobool(val):
