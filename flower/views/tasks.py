@@ -1,6 +1,5 @@
 import copy
 import logging
-from functools import total_ordering
 
 from tornado import web
 
@@ -21,26 +20,6 @@ class TaskView(BaseHandler):
         self.render("task.html", task=task)
 
 
-@total_ordering
-class Comparable:
-    """
-    Compare two objects, one or more of which may be None.  If one of the
-    values is None, the other will be deemed greater.
-    """
-
-    def __init__(self, value):
-        self.value = value
-
-    def __eq__(self, other):
-        return self.value == other.value
-
-    def __lt__(self, other):
-        try:
-            return self.value < other.value
-        except TypeError:
-            return self.value is None
-
-
 class TasksDataTable(BaseHandler):
     @web.authenticated
     def get(self):
@@ -51,44 +30,33 @@ class TasksDataTable(BaseHandler):
         search = self.get_argument('search[value]', type=str)
 
         column = self.get_argument('order[0][column]', type=int)
-        sort_by = self.get_argument(f'columns[{column}][data]', type=str)
-        sort_order = self.get_argument('order[0][dir]', type=str) == 'desc'
+        column_name = self.get_argument(f'columns[{column}][data]', type=str)
+        descending = self.get_argument('order[0][dir]', type=str) == 'desc'
+        sort_by = ('-' if descending else '') + column_name
 
-        def key(item):
-            return Comparable(getattr(item[1], sort_by))
+        # Funnel filtering + sorting through the shared iter_tasks so the page
+        # and /api/tasks stay semantically identical. Materialise the full
+        # filtered+sorted list once, then paginate it locally.
+        filtered_tasks = list(iter_tasks(app.events, sort_by=sort_by, search=search))
 
-        self.maybe_normalize_for_sort(app.events.state.tasks_by_timestamp(), sort_by)
+        # recordsTotal must be counted from the same source that produces the
+        # rows (tasks_by_timestamp), NOT len(state.tasks): those are different
+        # containers with different eviction bounds, which would desync the
+        # "filtered from N total" counter even with an empty search. A state
+        # filter expressed via the search box (e.g. "state:SUCCESS") counts as
+        # filtering, so recordsFiltered < recordsTotal is the correct result.
+        records_total = sum(1 for _ in app.events.state.tasks_by_timestamp())
 
-        sorted_tasks = sorted(
-            iter_tasks(app.events, search=search),
-            key=key,
-            reverse=sort_order
-        )
-
-        filtered_tasks = []
-
-        for task in sorted_tasks[start:start + length]:
+        data = []
+        for task in filtered_tasks[start:start + length]:
             task_dict = as_dict(self.format_task(task)[1])
             if task_dict.get('worker'):
                 task_dict['worker'] = task_dict['worker'].hostname
+            data.append(task_dict)
 
-            filtered_tasks.append(task_dict)
-
-        self.write(dict(draw=draw, data=filtered_tasks,
-                        recordsTotal=len(sorted_tasks),
-                        recordsFiltered=len(sorted_tasks)))
-
-    @classmethod
-    def maybe_normalize_for_sort(cls, tasks, sort_by):
-        sort_keys = {'name': str, 'state': str, 'received': float, 'started': float, 'runtime': float}
-        if sort_by in sort_keys:
-            for _, task in tasks:
-                attr_value = getattr(task, sort_by, None)
-                if attr_value:
-                    try:
-                        setattr(task, sort_by, sort_keys[sort_by](attr_value))
-                    except TypeError:
-                        pass
+        self.write(dict(draw=draw, data=data,
+                        recordsTotal=records_total,
+                        recordsFiltered=len(filtered_tasks)))
 
     @web.authenticated
     def post(self):

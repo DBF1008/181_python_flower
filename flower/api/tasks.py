@@ -406,7 +406,7 @@ Return length of all active queues
 
 class ListTasks(BaseTaskHandler):
     @web.authenticated
-    def get(self):
+    def get(self):  # pylint: disable=too-many-locals
         """
 List tasks
 
@@ -487,12 +487,14 @@ List tasks
 
 :query limit: maximum number of tasks
 :query offset: skip first n tasks
-:query sort_by: sort tasks by attribute (name, state, received, started)
+:query sort_by: sort tasks by attribute (e.g. name, state, received, started, runtime); prefix with '-' for descending order. Unknown attributes are ignored (stable order).
 :query workername: filter task by workername
 :query taskname: filter tasks by taskname
 :query state: filter tasks by state
 :query received_start: filter tasks by received date (must be greater than) format %Y-%m-%d %H:%M
 :query received_end: filter tasks by received date (must be less than) format %Y-%m-%d %H:%M
+:query started_start: filter tasks by started date (must be greater than) format %Y-%m-%d %H:%M
+:query started_end: filter tasks by started date (must be less than) format %Y-%m-%d %H:%M
 :reqheader Authorization: optional OAuth token to authenticate
 :statuscode 200: no error
 :statuscode 401: unauthorized request
@@ -505,6 +507,8 @@ List tasks
         state = self.get_argument('state', None)
         received_start = self.get_argument('received_start', None)
         received_end = self.get_argument('received_end', None)
+        started_start = self.get_argument('started_start', None)
+        started_end = self.get_argument('started_end', None)
         sort_by = self.get_argument('sort_by', None)
         search = self.get_argument('search', None)
 
@@ -520,6 +524,8 @@ List tasks
                 worker=worker, state=state,
                 received_start=received_start,
                 received_end=received_end,
+                started_start=started_start,
+                started_end=started_end,
                 search=search
         ):
             task = tasks.as_dict(task)

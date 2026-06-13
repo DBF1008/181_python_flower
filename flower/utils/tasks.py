@@ -1,7 +1,30 @@
 import datetime
 import time
+from functools import total_ordering
 
 from .search import parse_search_terms, satisfies_search_terms
+
+
+@total_ordering
+class Comparable:
+    """
+    Compare two objects, one or more of which may be None.  If one of the
+    values is None, the other will be deemed greater.  This makes sorting by
+    task attributes robust to missing/None values and to mixed types instead
+    of raising ``TypeError``.
+    """
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+    def __lt__(self, other):
+        try:
+            return self.value < other.value
+        except TypeError:
+            return self.value is None
 
 
 # pylint: disable=too-many-branches,too-many-locals,too-many-arguments
@@ -47,19 +70,21 @@ def iter_tasks(events, limit=None, offset=0, type=None, worker=None, state=None,
                 break
 
 
-sort_keys = {'name': str, 'state': str, 'received': float, 'started': float}
-
-
 def sort_tasks(tasks, sort_by):
-    assert sort_by.lstrip('-') in sort_keys
-    reverse = False
-    if sort_by.startswith('-'):
-        sort_by = sort_by.lstrip('-')
-        reverse = True
-    yield from sorted(
-            tasks,
-            key=lambda x: getattr(x[1], sort_by) or sort_keys[sort_by](),
-            reverse=reverse)
+    """Sort ``(uuid, task)`` pairs by any task attribute.
+
+    A leading ``-`` reverses the order (e.g. ``-received``).  Sorting uses
+    :class:`Comparable`, so ``None`` values and unknown/non-orderable
+    attributes degrade gracefully (stable order) rather than raising.  This is
+    the single sort implementation shared by the ``/tasks`` page and the
+    ``/api/tasks`` endpoint.
+    """
+    reverse = sort_by.startswith('-')
+    field = sort_by[1:] if reverse else sort_by
+    return sorted(
+        tasks,
+        key=lambda task: Comparable(getattr(task[1], field, None)),
+        reverse=reverse)
 
 
 def get_task_by_id(events, task_id):

@@ -216,3 +216,63 @@ class TaskTests(BaseApiTestCase):
         self.assertEqual(1, len(table))
         firstFetchedTaskName = table[list(table)[0]]['name']
         self.assertEqual("task1", firstFetchedTaskName)
+
+    def test_tasks_sort_by_runtime(self):
+        # Regression: sort_by=runtime used to raise AssertionError -> HTTP 500.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='2', runtime=10.0)
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='1', runtime=2.0)
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='3', runtime=20.0)
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        r = self.get('/api/tasks?sort_by=runtime')
+        table = json.loads(r.body.decode("utf-8"), object_pairs_hook=OrderedDict)
+        self.assertEqual(200, r.code)
+        self.assertEqual(['1', '2', '3'], list(table))
+
+    def test_page_and_api_return_identical_order(self):
+        # The whole point of the refactor: the same logical query yields the
+        # same rows in the same order on the page and the API.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='2', runtime=10.0)
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='1', runtime=2.0)
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='4', runtime=None)
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='3', runtime=20.0)
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        r = self.get('/api/tasks?sort_by=runtime&search=task1')
+        api_order = list(json.loads(r.body.decode("utf-8"),
+                                    object_pairs_hook=OrderedDict))
+
+        params = dict(draw=1, start=0, length=100)
+        params['search[value]'] = 'task1'
+        params['order[0][column]'] = 0
+        params['columns[0][data]'] = 'runtime'
+        params['order[0][dir]'] = 'asc'
+        r = self.get('/tasks/datatable?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+        dt_order = [row['uuid']
+                    for row in json.loads(r.body.decode("utf-8"))['data']]
+
+        self.assertEqual(api_order, dt_order)
+        # None runtime sorts first ascending -- identical on both surfaces.
+        self.assertEqual('4', api_order[0])

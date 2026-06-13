@@ -68,6 +68,21 @@ class TestSearchParser(unittest.TestCase):
             parse_search_terms('kwargs:some_kwarg1="some value1" kwargs:some_kwarg2="some value2"')
         )
 
+    def test_state_filter_parses(self):
+        self.assertEqual(
+            {'state': ['SUCCESS']},
+            parse_search_terms('state:SUCCESS')
+        )
+
+    def test_word_starting_with_state_is_treated_as_any(self):
+        # Regression: 'statement' must not be mis-parsed as a state filter.
+        # The prefix check used to omit the colon while still stripping
+        # len('state:') chars, turning 'statement' into {'state': ['ment']}.
+        self.assertEqual(
+            {'any': 'statement'},
+            parse_search_terms('statement')
+        )
+
 
 class TestStringfiedDictChecker(unittest.TestCase):
     def test_stringifies_args(self):

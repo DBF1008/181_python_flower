@@ -240,3 +240,124 @@ class TasksTest(AsyncHTTPTestCase):
         self.assertEqual('task2', tasks[0]['name'])
         self.assertEqual('456', tasks[0]['uuid'])
         self.assertEqual('worker1', tasks[0]['worker'])
+
+    def test_datatable_search_filters_counts(self):
+        # recordsTotal counts ALL tasks; recordsFiltered counts only matches.
+        # The old handler set both to the filtered count, so "(filtered from N
+        # total)" was always broken -- this case was previously untestable.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='alpha', id='1')
+        events += task_succeeded_events(worker='worker1', name='beta', id='2')
+        events += task_succeeded_events(worker='worker1', name='alpha2', id='3')
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(draw=1, start=0, length=10)
+        params['search[value]'] = 'alpha'
+        params['order[0][column]'] = 0
+        params['columns[0][data]'] = 'name'
+        params['order[0][dir]'] = 'asc'
+
+        r = self.get('/tasks/datatable?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        table = json.loads(r.body.decode("utf-8"))
+        self.assertEqual(200, r.code)
+        self.assertEqual(3, table['recordsTotal'])
+        self.assertEqual(2, table['recordsFiltered'])
+        self.assertEqual(['alpha', 'alpha2'],
+                         sorted(t['name'] for t in table['data']))
+
+    def test_datatable_state_search(self):
+        # The page filters by state through the search syntax ("state:VALUE").
+        # Guards the parse fix end-to-end on the page path.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1', id='1')
+        events += task_failed_events(worker='worker1', name='task2', id='2')
+        events += task_succeeded_events(worker='worker1', name='task3', id='3')
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(draw=1, start=0, length=10)
+        params['search[value]'] = 'state:SUCCESS'
+        params['order[0][column]'] = 0
+        params['columns[0][data]'] = 'name'
+        params['order[0][dir]'] = 'asc'
+
+        r = self.get('/tasks/datatable?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        table = json.loads(r.body.decode("utf-8"))
+        self.assertEqual(200, r.code)
+        self.assertEqual(3, table['recordsTotal'])
+        self.assertEqual(2, table['recordsFiltered'])
+        self.assertTrue(all(t['state'] == 'SUCCESS' for t in table['data']))
+
+    def test_datatable_sort_desc_runtime_none_last(self):
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='hi', runtime=100.0)
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='lo', runtime=1.0)
+        events += task_succeeded_events(worker='worker1', name='task',
+                                        id='none', runtime=None)
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(draw=1, start=0, length=10)
+        params['search[value]'] = ''
+        params['order[0][column]'] = 0
+        params['columns[0][data]'] = 'runtime'
+        params['order[0][dir]'] = 'desc'
+
+        r = self.get('/tasks/datatable?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        table = json.loads(r.body.decode("utf-8"))
+        self.assertEqual(200, r.code)
+        self.assertEqual(['hi', 'lo', 'none'],
+                         [t['uuid'] for t in table['data']])
+
+    def test_datatable_records_total_counts_row_source(self):
+        # recordsTotal must be counted from tasks_by_timestamp() (the source of
+        # the rows), not len(state.tasks); locks against a revert.
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1', id='1')
+        events += task_succeeded_events(worker='worker1', name='task2', id='2')
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(draw=1, start=0, length=10)
+        params['search[value]'] = ''
+        params['order[0][column]'] = 0
+        params['columns[0][data]'] = 'name'
+        params['order[0][dir]'] = 'asc'
+
+        r = self.get('/tasks/datatable?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        table = json.loads(r.body.decode("utf-8"))
+        self.assertEqual(200, r.code)
+        expected = len(list(self.app.events.state.tasks_by_timestamp()))
+        self.assertEqual(expected, table['recordsTotal'])
+        self.assertEqual(table['recordsTotal'], table['recordsFiltered'])
