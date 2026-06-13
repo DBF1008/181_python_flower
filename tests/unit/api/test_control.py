@@ -1,3 +1,4 @@
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -164,6 +165,48 @@ class WorkerControlTests(BaseApiTestCase):
             'add_consumer',
             reply=True, destination=['test'],
             arguments={'queue': 'foo&amp;bar'})
+
+    def test_no_reply_returns_504(self):
+        celery = self._app.capp
+        celery.control.pool_grow = MagicMock(return_value=[])
+        r = self.post('/api/worker/pool/grow/test', body={'n': 3})
+        self.assertEqual(504, r.code)
+        self.assertEqual(b"No response from worker 'test'", r.body)
+
+    def test_none_reply_returns_504(self):
+        celery = self._app.capp
+        celery.control.pool_grow = MagicMock(return_value=None)
+        r = self.post('/api/worker/pool/grow/test', body={'n': 3})
+        self.assertEqual(504, r.code)
+        self.assertEqual(b"No response from worker 'test'", r.body)
+
+    def test_reply_without_target_worker_returns_504(self):
+        # worker died after validation, or another worker answered: the
+        # requested worker is absent from the reply (was a KeyError -> 500)
+        celery = self._app.capp
+        celery.control.pool_grow = MagicMock(
+            return_value=[{'other': {'ok': ''}}])
+        r = self.post('/api/worker/pool/grow/test', body={'n': 3})
+        self.assertEqual(504, r.code)
+        self.assertEqual(b"No response from worker 'test'", r.body)
+
+    def test_pool_grow_failure_returns_worker_error_message(self):
+        celery = self._app.capp
+        celery.control.pool_grow = MagicMock(
+            return_value=[{'test': {'error': 'not enabled'}}])
+        r = self.post('/api/worker/pool/grow/test', body={'n': 3})
+        self.assertEqual(403, r.code)
+        self.assertEqual(
+            b"Failed to grow 'test' worker's pool: 'not enabled'", r.body)
+
+    def test_pool_autoscale_success_message(self):
+        celery = self._app.capp
+        celery.control.broadcast = MagicMock(return_value=[{'test': 'ok'}])
+        r = self.post('/api/worker/pool/autoscale/test',
+                      body={'min': 2, 'max': 5})
+        self.assertEqual(200, r.code)
+        self.assertEqual("Autoscaling 'test' worker (min=2, max=5)",
+                         json.loads(r.body)['message'])
 
 
 class TaskControlTests(BaseApiTestCase):
