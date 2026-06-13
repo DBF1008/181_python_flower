@@ -68,6 +68,26 @@ class TestSearchParser(unittest.TestCase):
             parse_search_terms('kwargs:some_kwarg1="some value1" kwargs:some_kwarg2="some value2"')
         )
 
+    def test_state_prefix_requires_colon(self):
+        """Bare word 'state' should be treated as 'any' search, not state filter."""
+        result = parse_search_terms('state')
+        self.assertEqual({'any': 'state'}, result)
+
+    def test_state_with_colon(self):
+        """'state:SUCCESS' should be parsed as state filter."""
+        result = parse_search_terms('state:SUCCESS')
+        self.assertEqual({'state': ['SUCCESS']}, result)
+
+    def test_state_multiple_values(self):
+        """Multiple state: filters should accumulate."""
+        result = parse_search_terms('state:SUCCESS state:FAILURE')
+        self.assertEqual({'state': ['SUCCESS', 'FAILURE']}, result)
+
+    def test_state_mixed_with_any(self):
+        """State filter and bare word should coexist."""
+        result = parse_search_terms('state:SUCCESS mytask')
+        self.assertEqual({'state': ['SUCCESS'], 'any': 'mytask'}, result)
+
 
 class TestStringfiedDictChecker(unittest.TestCase):
     def test_stringifies_args(self):

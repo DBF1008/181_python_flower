@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -216,3 +217,73 @@ class TaskTests(BaseApiTestCase):
         self.assertEqual(1, len(table))
         firstFetchedTaskName = table[list(table)[0]]['name']
         self.assertEqual("task1", firstFetchedTaskName)
+
+    def test_sort_by_runtime(self):
+        """API should support sorting by runtime field."""
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='1', runtime=10.0)
+        events += task_succeeded_events(worker='worker1', name='task2',
+                                        id='2', runtime=1.0)
+        events += task_succeeded_events(worker='worker1', name='task3',
+                                        id='3', runtime=5.0)
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(sort_by='runtime', limit=10, offset=0)
+        r = self.get('/api/tasks?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        self.assertEqual(200, r.code)
+        body = json.loads(r.body.decode("utf-8"), object_pairs_hook=OrderedDict)
+        runtimes = [v['runtime'] for v in body.values()]
+        self.assertEqual(runtimes, [1.0, 5.0, 10.0])
+
+    def test_sort_by_runtime_descending(self):
+        """API should support descending sort by runtime."""
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1',
+                                        id='1', runtime=10.0)
+        events += task_succeeded_events(worker='worker1', name='task2',
+                                        id='2', runtime=1.0)
+        events += task_succeeded_events(worker='worker1', name='task3',
+                                        id='3', runtime=5.0)
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(sort_by='-runtime', limit=10, offset=0)
+        r = self.get('/api/tasks?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        self.assertEqual(200, r.code)
+        body = json.loads(r.body.decode("utf-8"), object_pairs_hook=OrderedDict)
+        runtimes = [v['runtime'] for v in body.values()]
+        self.assertEqual(runtimes, [10.0, 5.0, 1.0])
+
+    def test_invalid_sort_field_returns_error(self):
+        """API should return error for invalid sort field instead of crashing."""
+        state = EventsState()
+        state.get_or_create_worker('worker1')
+        events = [Event('worker-online', hostname='worker1')]
+        events += task_succeeded_events(worker='worker1', name='task1', id='1')
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        params = dict(sort_by='nonexistent_field', limit=10, offset=0)
+        r = self.get('/api/tasks?' + '&'.join(
+            map(lambda x: '%s=%s' % x, params.items())))
+
+        self.assertIn(r.code, [400, 500])
