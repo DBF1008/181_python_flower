@@ -16,7 +16,7 @@ from celery.bin.base import CeleryCommand
 
 from .app import Flower
 from .urls import settings
-from .utils import abs_path, prepend_url, strtobool
+from .utils import abs_path, normalize_url_prefix, prepend_url, strtobool
 from .options import DEFAULT_CONFIG_FILE, default_options
 from .views.auth import validate_auth_option
 
@@ -161,7 +161,7 @@ def is_flower_envvar(name):
 def print_banner(app, ssl):
     if not options.unix_socket:
         if options.url_prefix:
-            prefix_str = f'/{options.url_prefix}/'
+            prefix_str = f'{normalize_url_prefix(options.url_prefix)}/'
         else:
             prefix_str = ''
 

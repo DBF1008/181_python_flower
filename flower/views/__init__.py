@@ -9,7 +9,7 @@ from base64 import b64decode
 
 import tornado
 
-from ..utils import template, bugreport, strtobool
+from ..utils import template, bugreport, safe_next_path, strtobool
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +28,10 @@ class BaseHandler(tornado.web.RequestHandler):
         self.finish()
 
     def render(self, *args, **kwargs):
-        app_options = self.application.options
         functions = inspect.getmembers(template, inspect.isfunction)
         assert not set(map(lambda x: x[0], functions)) & set(kwargs.keys())
         kwargs.update(functions)
-        kwargs.update(url_prefix=app_options.url_prefix)
+        kwargs.update(url_prefix=self.application.url_prefix)
         super().render(*args, **kwargs)
 
     def write_error(self, status_code, **kwargs):
@@ -90,6 +89,15 @@ class BaseHandler(tornado.web.RequestHandler):
             if re.match(self.application.options.auth, user):
                 return user
         return None
+
+    def get_next_redirect_url(self):
+        """Return the safe post-login redirect target for this request.
+
+        Centralizes ``next`` handling across all auth providers and guards
+        against open redirects (see :func:`flower.utils.safe_next_path`).
+        """
+        return safe_next_path(self.get_argument('next', ''),
+                              self.application.url_prefix)
 
     # pylint: disable=dangerous-default-value
     def get_argument(self, name, default=[], strip=True, type=None):

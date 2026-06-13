@@ -9,8 +9,10 @@ import celery
 from prometheus_client import Histogram
 from tornado.options import options
 
-from flower.command import (apply_env_options, apply_options, print_banner,
+from flower.command import (apply_env_options, apply_options, extract_settings,
+                            print_banner,
                             warn_about_celery_args_used_in_flower_command)
+from flower.urls import settings
 from tests.unit import AsyncHTTPTestCase
 
 
@@ -107,6 +109,16 @@ class TestPrintBanner(AsyncHTTPTestCase):
 
             self.assertTrue('INFO:flower.command:Visit me via unix socket file: foo' in cm.output)
 
+    def test_print_banner_with_url_prefix(self):
+        celery_app = celery.Celery()
+        with self.assertLogs('', level='INFO') as cm, \
+                self.mock_option('url_prefix', '/flower/'):
+            print_banner(celery_app, False)
+
+        output = '\n'.join(cm.output)
+        self.assertIn('Visit me at http://0.0.0.0:5555/flower/', output)
+        self.assertNotIn('//flower//', output)
+
 
 class TestWarnAboutCeleryArgsUsedInFlowerCommand(AsyncHTTPTestCase):
     @patch('flower.command.logger.warning')
@@ -191,3 +203,39 @@ class TestConfOption(AsyncHTTPTestCase):
         self.assertEqual(defined, documented,
                          msg='Missing option documentation. Make sure all options '
                              'are documented in docs/config.rst')
+
+
+class TestExtractSettings(AsyncHTTPTestCase):
+    """``extract_settings`` is the single place that prefixes the Tornado
+    ``login_url`` / ``static_url_prefix`` settings with ``url_prefix``."""
+
+    def setUp(self):
+        super().setUp()
+        # ``settings`` is a module-global dict shared across tests; snapshot it
+        # and pin the two keys we exercise so each test is deterministic.
+        self._settings_snapshot = dict(settings)
+        settings['login_url'] = '/login'
+        settings['static_url_prefix'] = '/static/'
+
+    def tearDown(self):
+        settings.clear()
+        settings.update(self._settings_snapshot)
+        super().tearDown()
+
+    def test_url_prefix_prepended(self):
+        with self.mock_option('url_prefix', 'flower'):
+            extract_settings()
+        self.assertEqual('/flower/login', settings['login_url'])
+        self.assertEqual('/flower/static/', settings['static_url_prefix'])
+
+    def test_url_prefix_with_slashes_normalized(self):
+        with self.mock_option('url_prefix', '/flower/'):
+            extract_settings()
+        self.assertEqual('/flower/login', settings['login_url'])
+        self.assertEqual('/flower/static/', settings['static_url_prefix'])
+
+    def test_no_url_prefix_keeps_defaults(self):
+        with self.mock_option('url_prefix', None):
+            extract_settings()
+        self.assertEqual('/login', settings['login_url'])
+        self.assertEqual('/static/', settings['static_url_prefix'])

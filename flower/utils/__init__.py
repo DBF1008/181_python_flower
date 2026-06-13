@@ -1,6 +1,7 @@
 import base64
 import os.path
 import uuid
+from urllib.parse import urlsplit
 
 from .. import __version__
 
@@ -36,8 +37,49 @@ def abs_path(path):
     return path
 
 
+def normalize_url_prefix(prefix):
+    """Return ``prefix`` as a canonical URL path prefix.
+
+    The result is either an empty string (no prefix) or a string with a single
+    leading slash and no trailing slash: ``flower`` and ``/flower/`` both
+    normalize to ``/flower``. This is the single source of truth for turning the
+    ``url_prefix`` option into something that can be prepended to a path.
+    """
+    if not prefix:
+        return ''
+    return '/' + prefix.strip('/')
+
+
 def prepend_url(url, prefix):
-    return '/' + prefix.strip('/') + url
+    return normalize_url_prefix(prefix) + url
+
+
+def safe_next_path(next_url, url_prefix=''):
+    """Return a safe in-app redirect target for a user-supplied ``next`` value.
+
+    Falls back to the application root when ``next_url`` is missing or points
+    outside the application, preventing open redirects (e.g.
+    ``next=https://evil.com`` or ``next=//evil.com``). ``url_prefix`` is the
+    application base path; the root fallback is ``<prefix>/`` so it matches the
+    prefixed root route instead of 404'ing.
+    """
+    root = normalize_url_prefix(url_prefix) + '/'
+    if not next_url:
+        return root
+    # Browsers treat backslashes as forward slashes, so normalize them before
+    # validating to avoid bypasses such as ``/\evil.com``.
+    candidate = next_url.replace('\\', '/')
+    # Reject protocol-relative URLs (//host) and anything carrying a scheme or
+    # network location (https://host, javascript:..., mailto:..., etc).
+    if candidate.startswith('//'):
+        return root
+    split = urlsplit(candidate)
+    if split.scheme or split.netloc:
+        return root
+    # Only allow absolute, in-app paths.
+    if not candidate.startswith('/'):
+        return root
+    return candidate
 
 
 def strtobool(val):

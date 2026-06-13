@@ -1,9 +1,11 @@
 import os
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from tornado.web import url
 
 from flower.app import rewrite_handler
+from flower.urls import settings
 from tests.unit import AsyncHTTPTestCase
 
 
@@ -63,3 +65,56 @@ class RewriteHandlerTests(AsyncHTTPTestCase):
         new_handler = rewrite_handler(old_handler, 'test_root')
         self.assertIsInstance(new_handler, tuple)
         self.assertEqual(new_handler[0], '/test_root/')
+
+
+class URLPrefixRenderTests(AsyncHTTPTestCase):
+    """Under ``url_prefix`` a rendered page must emit the normalized prefix
+    (hidden ``#url_prefix`` input) and prefixed static URLs."""
+
+    def setUp(self):
+        self.url_prefix = '/test_root'
+        self._settings_snapshot = dict(settings)
+        # Mirror production wiring: extract_settings() prefixes static_url_prefix.
+        settings['static_url_prefix'] = '/test_root/static/'
+        with self.mock_option('url_prefix', self.url_prefix):
+            super().setUp()
+
+    def tearDown(self):
+        settings.clear()
+        settings.update(self._settings_snapshot)
+        super().tearDown()
+
+    def test_render_emits_normalized_prefix_and_static(self):
+        r = self.get(self.url_prefix + '/')
+        self.assertEqual(200, r.code)
+        body = r.body.decode()
+        # Hidden input that the frontend JS reads as its single prefix source.
+        self.assertIn('value="/test_root"', body)
+        # Static assets carry the prefix (version query string may follow).
+        self.assertIn('/test_root/static/css/bootstrap.min.css', body)
+
+
+class URLPrefixLoginRedirectTests(AsyncHTTPTestCase):
+    """Under ``url_prefix`` an unauthenticated GET to a protected page must
+    302-redirect to the prefixed login URL with a prefixed ``next``."""
+
+    def setUp(self):
+        self.url_prefix = '/test_root'
+        self._settings_snapshot = dict(settings)
+        settings['login_url'] = '/test_root/login'
+        with self.mock_option('url_prefix', self.url_prefix):
+            super().setUp()
+
+    def tearDown(self):
+        settings.clear()
+        settings.update(self._settings_snapshot)
+        super().tearDown()
+
+    def test_unauthenticated_get_redirects_with_prefixed_next(self):
+        with self.mock_option('auth', '.*@example.com'):
+            r = self.get(self.url_prefix + '/', follow_redirects=False)
+        self.assertEqual(302, r.code)
+        location = r.headers['Location']
+        self.assertTrue(location.startswith('/test_root/login'), location)
+        next_param = parse_qs(urlsplit(location).query).get('next', [''])[0]
+        self.assertEqual('/test_root/', next_param)

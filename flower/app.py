@@ -14,6 +14,7 @@ from .urls import handlers as default_handlers
 from .events import Events
 from .inspector import Inspector
 from .options import default_options
+from .utils import normalize_url_prefix
 
 
 logger = logging.getLogger(__name__)
@@ -23,12 +24,12 @@ if sys.version_info[0] == 3 and sys.version_info[1] >= 8 and sys.platform.starts
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# pylint: disable=consider-using-f-string
 def rewrite_handler(handler, url_prefix):
+    prefix = normalize_url_prefix(url_prefix)
     if isinstance(handler, url):
-        return url("/{}{}".format(url_prefix.strip("/"), handler.regex.pattern),
+        return url(prefix + handler.regex.pattern,
                    handler.handler_class, handler.kwargs, handler.name)
-    return ("/{}{}".format(url_prefix.strip("/"), handler[0]), handler[1])
+    return (prefix + handler[0], handler[1])
 
 
 class Flower(tornado.web.Application):
@@ -43,6 +44,7 @@ class Flower(tornado.web.Application):
         kwargs.update(handlers=handlers)
         super().__init__(**kwargs)
         self.options = options or default_options
+        self.url_prefix = normalize_url_prefix(self.options.url_prefix)
         self.io_loop = io_loop or ioloop.IOLoop.instance()
         self.ssl_options = kwargs.get('ssl_options', None)
 
