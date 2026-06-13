@@ -62,6 +62,35 @@ class EventsState(State):
         self.counter = collections.defaultdict(Counter)
         self.metrics = get_prometheus_metrics()
 
+    def __reduce__(self):
+        # celery's State.__reduce__ returns a 2-tuple (cls, args); unpickling
+        # therefore rebuilds workers/tasks by re-running __init__, which resets
+        # Flower's own per-worker `counter` to empty. Append it as pickle state
+        # so the cumulative dashboard counts survive a `--persistent` restart.
+        # `metrics` is process-local (bound to the global Prometheus registry)
+        # and is deliberately NOT persisted; __init__ re-binds it on load.
+        reductor, args = super().__reduce__()[:2]
+        return reductor, args, {'counter': dict(self.counter)}
+
+    def __setstate__(self, state):
+        counter = collections.defaultdict(Counter)
+        counter.update(state.get('counter', {}))
+        self.counter = counter
+
+    def rebuild_metrics(self):
+        # Re-seed the process-local Prometheus gauges from the recovered worker
+        # registry. After a restart the registry survives but the gauges start
+        # empty, so /metrics would disagree with the dashboard (which derives
+        # liveness from Worker.alive) until the next heartbeat/offline event.
+        # Reconciling here keeps both surfaces consistent across a restart.
+        for worker_name, worker in self.workers.items():
+            online = bool(worker.alive)
+            self.metrics.worker_online.labels(worker_name).set(1 if online else 0)
+            active = getattr(worker, 'active', None)
+            self.metrics.worker_number_of_currently_executing_tasks.labels(worker_name).set(
+                active if online and active is not None else 0
+            )
+
     def event(self, event):
         # Save the event
         super().event(event)
@@ -142,6 +171,11 @@ class Events(threading.Thread):
 
         if not self.state:
             self.state = EventsState(**kwargs)
+        elif self.persistent:
+            # We recovered a persisted state: reconcile the process-local
+            # Prometheus metrics with it so the dashboard and /metrics agree
+            # immediately after the restart instead of drifting.
+            self.state.rebuild_metrics()
 
         self.timer = PeriodicCallback(self.on_enable_events,
                                       self.events_enable_interval)
